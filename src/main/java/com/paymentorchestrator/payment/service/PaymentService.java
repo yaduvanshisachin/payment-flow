@@ -4,13 +4,18 @@ import com.paymentorchestrator.payment.domain.Payment;
 import com.paymentorchestrator.payment.domain.PaymentStatus;
 import com.paymentorchestrator.payment.dto.CreatePaymentRequest;
 import com.paymentorchestrator.payment.dto.PaymentResponse;
+import com.paymentorchestrator.payment.event.PaymentCreatedPayload;
 import com.paymentorchestrator.payment.exception.IdempotencyConflictException;
 import com.paymentorchestrator.payment.exception.PaymentNotFoundException;
+import com.paymentorchestrator.payment.outbox.OutboxService;
 import com.paymentorchestrator.payment.repository.PaymentRepository;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
+import java.time.Instant;
 import java.util.UUID;
 
 @Service
@@ -18,10 +23,26 @@ public class PaymentService {
 
     private final PaymentRepository paymentRepository;
     private final IdempotencyService idempotencyService;
+    private final OutboxService outboxService;
+    private final TransactionTemplate transactionTemplate;
 
-    public PaymentService(PaymentRepository paymentRepository, IdempotencyService idempotencyService) {
+    public PaymentService(PaymentRepository paymentRepository, IdempotencyService idempotencyService,
+                          OutboxService outboxService, PlatformTransactionManager transactionManager) {
         this.paymentRepository = paymentRepository;
         this.idempotencyService = idempotencyService;
+        this.outboxService = outboxService;
+        // persistNewPayment() is called as this.persistNewPayment(...) from
+        // createPayment() below - a self-invocation. Spring's @Transactional
+        // is implemented via a proxy wrapping this bean, and self-invocation
+        // calls the real object directly, bypassing that proxy entirely. An
+        // @Transactional annotation on persistNewPayment would therefore be
+        // silently ignored - no transaction would actually be open when
+        // outboxService.record() runs, and since that method requires one
+        // (Propagation.MANDATORY), it would throw at runtime. Using
+        // TransactionTemplate programmatically sidesteps the proxy issue
+        // entirely by demarcating the transaction explicitly, right here,
+        // rather than relying on an annotation that self-invocation defeats.
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     /**
@@ -62,16 +83,37 @@ public class PaymentService {
         }
     }
 
-    @Transactional
-    protected Payment persistNewPayment(CreatePaymentRequest request, String idempotencyKey) {
-        Payment payment = new Payment(idempotencyKey, request.merchantId(), request.amount(), request.currency());
-        // No async pipeline yet (that's week 2+), but conceptually creating
-        // a payment means it has been accepted for processing - so we move
-        // it straight to PENDING here rather than leaving it sitting in
-        // CREATED. Once the Kafka pipeline exists, this transition moves
-        // to the outbox-driven flow instead of happening inline.
-        payment.transitionTo(PaymentStatus.PENDING);
-        return paymentRepository.save(payment);
+    /**
+     * Persists the payment in CREATED status and, in the SAME transaction,
+     * writes a "payment.created" outbox row (see OutboxService). The payment
+     * does NOT jump to PENDING here anymore - that transition now happens
+     * asynchronously, driven by PaymentEventConsumer after the event has
+     * round-tripped through Kafka. This is deliberate: it's what makes the
+     * API handler's job purely "durably record intent" and pushes all
+     * actual processing onto the async pipeline, which is the whole point
+     * of week 2.
+     *
+     * See the constructor comment for why this uses TransactionTemplate
+     * instead of @Transactional.
+     */
+    private Payment persistNewPayment(CreatePaymentRequest request, String idempotencyKey) {
+        return transactionTemplate.execute(status -> {
+            Payment payment = new Payment(idempotencyKey, request.merchantId(), request.amount(), request.currency());
+            Payment saved = paymentRepository.save(payment);
+
+            PaymentCreatedPayload payload = new PaymentCreatedPayload(
+                    UUID.randomUUID(),
+                    saved.getId(),
+                    saved.getMerchantId(),
+                    saved.getAmount(),
+                    saved.getCurrency(),
+                    saved.getStatus().name(),
+                    Instant.now()
+            );
+            outboxService.record("PAYMENT", saved.getId(), "payment.created", payload);
+
+            return saved;
+        });
     }
 
     @Transactional(readOnly = true)

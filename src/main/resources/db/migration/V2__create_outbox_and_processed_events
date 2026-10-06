@@ -1,0 +1,35 @@
+-- Transactional outbox: a row here is written in the SAME DB transaction as
+-- the business change it describes (see OutboxService.record, called from
+-- PaymentService.persistNewPayment). That's what makes the pattern work -
+-- either both the Payment row and its outbox row commit, or neither does.
+-- A separate poller (OutboxPublisher) later reads PENDING rows and publishes
+-- them to Kafka, marking them PUBLISHED once the broker has acknowledged.
+CREATE TABLE outbox_events (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type VARCHAR(50)  NOT NULL,
+    aggregate_id   UUID         NOT NULL,
+    event_type     VARCHAR(100) NOT NULL,
+    payload        TEXT         NOT NULL,
+    status         VARCHAR(20)  NOT NULL DEFAULT 'PENDING',
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    published_at   TIMESTAMPTZ
+);
+
+-- The publisher's poll query is "give me PENDING rows, oldest first" - this
+-- partial index keeps that query cheap even once PUBLISHED rows pile up,
+-- since it only indexes the rows that still need work.
+CREATE INDEX idx_outbox_events_pending ON outbox_events (created_at)
+    WHERE status = 'PENDING';
+
+-- Consumer-side idempotency. Kafka (with manual offset commit) gives
+-- at-least-once delivery, meaning the SAME event can be redelivered after a
+-- crash or rebalance. (event_id, consumer_name) lets each consumer group
+-- independently track what it has already handled, so redelivery is safe -
+-- see PaymentEventConsumer.
+CREATE TABLE processed_events (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id       UUID         NOT NULL,
+    consumer_name  VARCHAR(100) NOT NULL,
+    processed_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT uk_processed_events_event_consumer UNIQUE (event_id, consumer_name)
+);
